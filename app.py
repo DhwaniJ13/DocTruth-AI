@@ -1,11 +1,11 @@
 import streamlit as st
 import fitz
 import pytesseract
-from PIL import Image
-import io
-import os
 import json
+import os
 import re
+import io
+from PIL import Image
 from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
@@ -15,91 +15,231 @@ from google import genai
 # CONFIGURATION
 # ============================================================
 
-load_dotenv()
-
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
+st.set_page_config(
+    page_title="DocTruth AI",
+    page_icon="🛡️",
+    layout="wide"
 )
 
+# Tesseract path
 pytesseract.pytesseract.tesseract_cmd = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 
+# Load environment variables
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    st.error(
+        "GEMINI_API_KEY not found. Please check your .env file."
+    )
+    st.stop()
+
+# Gemini client
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+MODEL_NAME = "gemini-3.5-flash-lite"
+
 
 # ============================================================
-# AI EXTRACTION WITH EVIDENCE
+# PAGE HEADER
 # ============================================================
 
-def extract_structured_data(text):
+st.title("🛡️ DocTruth AI")
+st.caption(
+    "AI-powered document intelligence with extraction, validation and evidence verification."
+)
 
-    prompt = """
-You are a document intelligence assistant.
+st.divider()
 
-Extract important information from the document.
 
-For every extracted field, return:
-- value
-- evidence
+# ============================================================
+# FUNCTIONS
+# ============================================================
 
-The evidence MUST be an exact short quote copied from the
-provided document text that supports the value.
+def extract_text_from_image(uploaded_file):
+    """
+    Extract text from an uploaded image using Tesseract OCR.
+    """
 
-If a field is not present:
-- value = null
-- evidence = null
+    image = Image.open(uploaded_file)
 
-Return JSON only.
+    text = pytesseract.image_to_string(
+        image
+    )
 
-Use these fields:
+    return text
 
-- document_type
-- invoice_number
-- date
-- customer_name
-- vendor_name
-- total_amount
-- currency
-- phone
-- email
 
-Rules:
+def extract_text_from_pdf(uploaded_file):
+    """
+    Extract text from a PDF.
+    First tries normal PDF text extraction.
+    If a page has no text, OCR is used.
+    """
+
+    pdf_bytes = uploaded_file.read()
+
+    document = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
+
+    all_text = []
+
+    for page_number, page in enumerate(document):
+
+        # Try normal PDF text extraction
+        page_text = page.get_text(
+            "text"
+        ).strip()
+
+        if page_text:
+            all_text.append(
+                f"\n--- Page {page_number + 1} ---\n"
+            )
+            all_text.append(
+                page_text
+            )
+
+        else:
+            # OCR fallback for scanned pages
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2)
+            )
+
+            image_bytes = pix.tobytes(
+                "png"
+            )
+
+            image = Image.open(
+                io.BytesIO(image_bytes)
+            )
+
+            ocr_text = pytesseract.image_to_string(
+                image
+            )
+
+            all_text.append(
+                f"\n--- Page {page_number + 1} ---\n"
+            )
+
+            all_text.append(
+                ocr_text
+            )
+
+    document.close()
+
+    return "\n".join(
+        all_text
+    )
+
+
+def extract_document_text(uploaded_file):
+    """
+    Decide whether the uploaded file is a PDF or image.
+    """
+
+    file_name = uploaded_file.name.lower()
+
+    if file_name.endswith(".pdf"):
+        return extract_text_from_pdf(
+            uploaded_file
+        )
+
+    else:
+        return extract_text_from_image(
+            uploaded_file
+        )
+
+
+def extract_structured_data(document_text):
+    """
+    Send extracted document text to Gemini
+    and return structured JSON.
+    """
+
+    prompt = f"""
+You are a document intelligence system.
+
+Your job is to extract structured information from the
+provided document text.
+
+IMPORTANT RULES:
 
 1. Never invent information.
-2. Evidence must come directly from the document.
-3. Keep evidence short.
-4. Do not create evidence for a missing field.
-5. Only classify something as vendor_name if the document
-   clearly identifies it as a vendor/company/service provider.
-6. For total_amount, return the numeric value.
-7. Preserve original information when possible.
+2. Only use information explicitly present in the document.
+3. If a field is missing, return null.
+4. Every extracted field must include evidence.
+5. Evidence must be an exact short quote copied from the document text.
+6. Do not create evidence that does not exist.
+7. Preserve values as accurately as possible.
+8. For vendor_name, only identify a vendor/company/service provider
+   when the document clearly supports it.
+9. total_amount should contain the numeric total amount if available.
+10. Return ONLY valid JSON.
 
-Example:
+Return exactly this structure:
 
-{
-    "document_type": {
-        "value": "invoice",
-        "evidence": "Invoice"
-    },
-    "invoice_number": {
-        "value": "INV-1024",
-        "evidence": "Invoice No: INV-1024"
-    },
-    "date": {
-        "value": "15/09/2026",
-        "evidence": "Date: 15/09/2026"
-    },
-    "customer_name": {
-        "value": null,
-        "evidence": null
-    }
-}
+{{
+    "document_type": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "invoice_number": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "date": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "customer_name": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "vendor_name": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "total_amount": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "currency": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "phone": {{
+        "value": "...",
+        "evidence": "..."
+    }},
+    "email": {{
+        "value": "...",
+        "evidence": "..."
+    }}
+}}
 
-DOCUMENT:
+If a field does not exist:
 
-""" + text
+{{
+    "value": null,
+    "evidence": null
+}}
+
+DOCUMENT TEXT:
+
+-------------------------
+{document_text}
+-------------------------
+"""
 
     response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
+        model=MODEL_NAME,
         contents=prompt,
         config={
             "response_mime_type": "application/json"
@@ -109,392 +249,344 @@ DOCUMENT:
     return response.text
 
 
-# ============================================================
-# EVIDENCE VERIFICATION
-# ============================================================
+def clean_json_response(text):
+    """
+    Remove accidental markdown JSON fences.
+    """
 
-def verify_evidence(value, evidence, original_text):
+    text = text.strip()
 
-    if not value or not evidence:
+    if text.startswith("```json"):
+        text = text[
+            7:
+        ]
+
+    elif text.startswith("```"):
+        text = text[
+            3:
+        ]
+
+    if text.endswith("```"):
+        text = text[
+            :-3
+        ]
+
+    return text.strip()
+
+
+def normalize_text(text):
+    """
+    Normalize text for evidence comparison.
+    """
+
+    if not text:
+        return ""
+
+    return " ".join(
+        str(text).lower().split()
+    )
+
+
+def simplified_text(text):
+    """
+    Remove punctuation and spaces for
+    a more tolerant evidence comparison.
+    """
+
+    if not text:
+        return ""
+
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(text).lower()
+    )
+
+
+def verify_evidence(
+    evidence,
+    original_text
+):
+    """
+    Check whether the evidence actually exists
+    in the source document.
+    """
+
+    if not evidence:
         return False
 
-    normalized_document = re.sub(
-        r"\s+",
-        " ",
+    normalized_evidence = normalize_text(
+        evidence
+    )
+
+    normalized_document = normalize_text(
         original_text
-    ).strip().lower()
+    )
 
-    normalized_evidence = re.sub(
-        r"\s+",
-        " ",
-        str(evidence)
-    ).strip().lower()
-
-    # Exact evidence match
-    if normalized_evidence in normalized_document:
+    if (
+        normalized_evidence
+        in normalized_document
+    ):
         return True
 
-    # Simplified comparison for OCR punctuation differences
-    simplified_document = re.sub(
-        r"[^a-z0-9@.\s]",
-        "",
-        normalized_document
+    simplified_evidence = simplified_text(
+        evidence
     )
 
-    simplified_evidence = re.sub(
-        r"[^a-z0-9@.\s]",
-        "",
-        normalized_evidence
+    simplified_document = simplified_text(
+        original_text
     )
 
-    return simplified_evidence in simplified_document
+    if (
+        simplified_evidence
+        and simplified_evidence
+        in simplified_document
+    ):
+        return True
+
+    return False
 
 
-# ============================================================
-# VALIDATION + CONFIDENCE
-# ============================================================
+def validate_field(
+    field,
+    value
+):
+    """
+    Basic rule-based validation.
+    """
 
-def validate_data(data, original_text):
+    if value is None:
+        return "Missing"
 
-    results = []
+    value_string = str(
+        value
+    ).strip()
 
-    overall_score = 0
-    scored_fields = 0
+    if not value_string:
+        return "Missing"
 
-    for field_name, field_data in data.items():
+    # Email validation
+    if field == "email":
 
-        # ----------------------------------------------------
-        # Extract value and evidence
-        # ----------------------------------------------------
+        email_pattern = (
+            r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+        )
 
-        if isinstance(field_data, dict):
+        if re.match(
+            email_pattern,
+            value_string
+        ):
+            return "Valid"
 
-            value = field_data.get("value")
-            evidence = field_data.get("evidence")
+        return "Invalid"
+
+    # Phone validation
+    if field == "phone":
+
+        digits = re.sub(
+            r"\D",
+            "",
+            value_string
+        )
+
+        if 10 <= len(digits) <= 15:
+            return "Valid"
+
+        return "Invalid"
+
+    # Amount validation
+    if field == "total_amount":
+
+        amount = re.sub(
+            r"[^\d.]",
+            "",
+            value_string
+        )
+
+        try:
+            float(amount)
+            return "Valid"
+
+        except ValueError:
+            return "Invalid"
+
+    # Date validation
+    if field == "date":
+
+        date_formats = [
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%Y-%m-%d",
+            "%d/%m/%y",
+            "%d-%m-%y"
+        ]
+
+        for fmt in date_formats:
+
+            try:
+                datetime.strptime(
+                    value_string,
+                    fmt
+                )
+
+                return "Valid"
+
+            except ValueError:
+                continue
+
+        return "Invalid"
+
+    # Document type
+    if field == "document_type":
+
+        if len(value_string) > 1:
+            return "Valid"
+
+        return "Invalid"
+
+    # Other fields
+    return "Valid"
+
+
+def calculate_confidence(
+    value,
+    status,
+    evidence_verified
+):
+    """
+    Calculate field-level confidence.
+    """
+
+    if value is None:
+        return 0
+
+    score = 50
+
+    if evidence_verified:
+        score += 30
+
+    if status == "Valid":
+        score += 20
+
+    elif status == "Invalid":
+        score -= 30
+
+    if not evidence_verified:
+        score -= 20
+
+    score = max(
+        0,
+        min(
+            100,
+            score
+        )
+    )
+
+    return score
+
+
+def confidence_label(score):
+
+    if score >= 80:
+        return "🟢 High"
+
+    elif score >= 50:
+        return "🟡 Medium"
+
+    return "🔴 Low"
+
+
+def process_validation(
+    structured_data,
+    original_text
+):
+    """
+    Validate all extracted fields and
+    calculate confidence.
+    """
+
+    results = {}
+
+    for field, details in structured_data.items():
+
+        if isinstance(
+            details,
+            dict
+        ):
+
+            value = details.get(
+                "value"
+            )
+
+            evidence = details.get(
+                "evidence"
+            )
 
         else:
 
-            value = field_data
+            value = details
             evidence = None
 
-        display_name = field_name.replace(
-            "_",
-            " "
-        ).title()
-
-
-        # ----------------------------------------------------
-        # Missing field
-        # ----------------------------------------------------
-
-        if value is None or str(value).strip() == "":
-
-            results.append(
-                {
-                    "field": display_name,
-                    "status": "Missing",
-                    "message": "No value found.",
-                    "evidence_verified": False,
-                    "value": None,
-                    "evidence": None,
-                    "confidence": 0
-                }
-            )
-
-            continue
-
-
-        # ----------------------------------------------------
-        # Evidence verification
-        # ----------------------------------------------------
+        status = validate_field(
+            field,
+            value
+        )
 
         evidence_verified = verify_evidence(
-            value,
             evidence,
             original_text
         )
 
-
-        # ----------------------------------------------------
-        # Base confidence
-        # ----------------------------------------------------
-
-        field_confidence = 50
-
-
-        # Evidence verified
-        if evidence_verified:
-            field_confidence += 30
-
-
-        # ----------------------------------------------------
-        # Email validation
-        # ----------------------------------------------------
-
-        if field_name == "email":
-
-            email_pattern = (
-                r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
-            )
-
-            if re.match(
-                email_pattern,
-                str(value)
-            ):
-
-                status = "Valid"
-
-                message = (
-                    "Email format is valid."
-                )
-
-                field_confidence += 20
-
-            else:
-
-                status = "Invalid"
-
-                message = (
-                    "Email format appears incorrect."
-                )
-
-                field_confidence -= 30
-
-
-        # ----------------------------------------------------
-        # Phone validation
-        # ----------------------------------------------------
-
-        elif field_name == "phone":
-
-            digits = re.sub(
-                r"\D",
-                "",
-                str(value)
-            )
-
-            if 10 <= len(digits) <= 15:
-
-                status = "Valid"
-
-                message = (
-                    "Phone number has a plausible length."
-                )
-
-                field_confidence += 20
-
-            else:
-
-                status = "Invalid"
-
-                message = (
-                    "Phone number length looks unusual."
-                )
-
-                field_confidence -= 30
-
-
-        # ----------------------------------------------------
-        # Date validation
-        # ----------------------------------------------------
-
-        elif field_name == "date":
-
-            valid_date = False
-
-            date_formats = [
-                "%d/%m/%Y",
-                "%d-%m-%Y",
-                "%Y-%m-%d",
-                "%d/%m/%y",
-                "%d-%m-%y"
-            ]
-
-            for fmt in date_formats:
-
-                try:
-
-                    datetime.strptime(
-                        str(value),
-                        fmt
-                    )
-
-                    valid_date = True
-                    break
-
-                except ValueError:
-                    pass
-
-            if valid_date:
-
-                status = "Valid"
-
-                message = (
-                    "Date format is valid."
-                )
-
-                field_confidence += 20
-
-            else:
-
-                status = "Needs review"
-
-                message = (
-                    "Date was extracted but could "
-                    "not be verified."
-                )
-
-                field_confidence -= 10
-
-
-        # ----------------------------------------------------
-        # Amount validation
-        # ----------------------------------------------------
-
-        elif field_name == "total_amount":
-
-            try:
-
-                float(
-                    str(value).replace(",", "")
-                )
-
-                status = "Valid"
-
-                message = (
-                    "Amount is numeric."
-                )
-
-                field_confidence += 20
-
-            except ValueError:
-
-                status = "Invalid"
-
-                message = (
-                    "Amount is not numeric."
-                )
-
-                field_confidence -= 30
-
-
-        # ----------------------------------------------------
-        # Document type
-        # ----------------------------------------------------
-
-        elif field_name == "document_type":
-
-            status = "Detected"
-
-            message = (
-                "Document type identified."
-            )
-
-
-        # ----------------------------------------------------
-        # Other fields
-        # ----------------------------------------------------
-
-        else:
-
-            status = "Extracted"
-
-            message = (
-                "Value extracted from document."
-            )
-
-
-        # ----------------------------------------------------
-        # Evidence failure
-        # ----------------------------------------------------
-
-        if not evidence_verified:
-
-            field_confidence -= 20
-
-            message += (
-                " Evidence could not be verified "
-                "against the original text."
-            )
-
-
-        # ----------------------------------------------------
-        # Keep confidence between 0 and 100
-        # ----------------------------------------------------
-
-        field_confidence = max(
-            0,
-            min(100, field_confidence)
+        confidence = calculate_confidence(
+            value,
+            status,
+            evidence_verified
         )
 
+        results[field] = {
+            "value": value,
+            "evidence": evidence,
+            "status": status,
+            "evidence_verified": evidence_verified,
+            "confidence": confidence
+        }
 
-        # Add to overall score
-        overall_score += field_confidence
-        scored_fields += 1
-
-
-        # ----------------------------------------------------
-        # Store result
-        # ----------------------------------------------------
-
-        results.append(
-            {
-                "field": display_name,
-                "status": status,
-                "message": message,
-                "evidence_verified": evidence_verified,
-                "value": value,
-                "evidence": evidence,
-                "confidence": field_confidence
-            }
-        )
+    return results
 
 
-    # --------------------------------------------------------
-    # Overall confidence
-    # --------------------------------------------------------
+def calculate_overall_quality(
+    validation_results
+):
+    """
+    Calculate average confidence
+    of fields that were extracted.
+    """
 
-    if scored_fields > 0:
+    scores = []
 
-        overall_score = round(
-            overall_score / scored_fields
-        )
+    for field, result in validation_results.items():
 
-    else:
+        if result["value"] is not None:
+            scores.append(
+                result["confidence"]
+            )
 
-        overall_score = 0
+    if not scores:
+        return 0
 
-
-    return results, overall_score
+    return round(
+        sum(scores) / len(scores)
+    )
 
 
 # ============================================================
-# STREAMLIT PAGE
+# FILE UPLOAD
 # ============================================================
 
-st.set_page_config(
-    page_title="DocTruth AI",
-    page_icon="📄",
-    layout="wide"
-)
-
-st.title("📄 DocTruth AI")
-
-st.write(
-    "From unstructured documents to structured, verified data."
-)
-
-st.divider()
-
-
-# ============================================================
-# UPLOAD
-# ============================================================
-
-st.subheader("📤 Upload your document")
+st.subheader("📄 Upload Document")
 
 uploaded_file = st.file_uploader(
-    "Upload a PDF or image",
+    "Upload a PDF or image document",
     type=[
         "pdf",
         "png",
@@ -505,352 +597,321 @@ uploaded_file = st.file_uploader(
 
 
 # ============================================================
-# DOCUMENT PROCESSING
+# PROCESS DOCUMENT
 # ============================================================
 
-if uploaded_file is not None:
+if uploaded_file:
 
-    file_bytes = uploaded_file.read()
-
-    st.success(
-        "Document uploaded successfully!"
-    )
-
-    st.write(
-        "**File name:**",
-        uploaded_file.name
-    )
-
-    st.write(
-        "**File type:**",
-        uploaded_file.type
-    )
-
-    st.write(
-        "**File size:**",
-        uploaded_file.size,
-        "bytes"
-    )
-
-    st.divider()
-
-
-    # ========================================================
-    # IMAGE OCR
-    # ========================================================
-
-    if uploaded_file.type.startswith("image/"):
-
-        st.subheader("🔍 OCR Processing")
-
-        image = Image.open(
-            io.BytesIO(file_bytes)
-        )
-
-        st.image(
-            image,
-            caption="Uploaded document",
-            width=500
-        )
-
-        with st.spinner(
-            "Reading document with OCR..."
-        ):
-
-            full_text = pytesseract.image_to_string(
-                image
-            )
-
-        st.success("OCR completed!")
-
-        st.subheader("📝 Extracted Text")
-
-        st.text_area(
-            "OCR Result",
-            full_text,
-            height=400
-        )
-
-
-    # ========================================================
-    # PDF PROCESSING
-    # ========================================================
-
-    elif uploaded_file.type == "application/pdf":
-
-        document = fitz.open(
-            stream=file_bytes,
-            filetype="pdf"
-        )
-
-        st.write(
-            "**Number of pages:**",
-            len(document)
-        )
-
-        full_text = ""
-
-        for page_number, page in enumerate(document):
-
-            text = page.get_text()
-
-            if text.strip():
-
-                full_text += text + "\n"
-
-                with st.expander(
-                    f"Page {page_number + 1} — Text extracted"
-                ):
-
-                    st.text(text)
-
-            else:
-
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(2, 2)
-                )
-
-                image = Image.frombytes(
-                    "RGB",
-                    [
-                        pix.width,
-                        pix.height
-                    ],
-                    pix.samples
-                )
-
-                with st.spinner(
-                    f"Running OCR on page {page_number + 1}..."
-                ):
-
-                    ocr_text = pytesseract.image_to_string(
-                        image
-                    )
-
-                full_text += ocr_text + "\n"
-
-                with st.expander(
-                    f"Page {page_number + 1} — OCR"
-                ):
-
-                    st.text(ocr_text)
-
-
-        st.divider()
-
-        st.subheader(
-            "📝 Complete Document Text"
-        )
-
-        st.text_area(
-            "Extracted text",
-            full_text,
-            height=400
-        )
-
-
-    # ========================================================
-    # AI EXTRACTION
-    # ========================================================
-
-    st.divider()
-
-    st.subheader(
-        "🤖 AI Structured Extraction"
+    st.info(
+        f"Selected document: **{uploaded_file.name}**"
     )
 
     if st.button(
-        "Extract structured data",
+        "🚀 Analyze Document",
         type="primary"
     ):
 
-        if full_text.strip():
+        # ----------------------------------------------------
+        # STEP 1 — TEXT EXTRACTION
+        # ----------------------------------------------------
 
-            with st.spinner(
-                "AI is analyzing the document..."
-            ):
+        with st.spinner(
+            "Extracting text from document..."
+        ):
 
-                try:
+            try:
 
-                    structured_json = (
-                        extract_structured_data(
-                            full_text
-                        )
-                    )
+                full_text = extract_document_text(
+                    uploaded_file
+                )
 
-                    structured_data = json.loads(
-                        structured_json
-                    )
+            except Exception as e:
 
-                    st.session_state[
-                        "structured_data"
-                    ] = structured_data
+                st.error(
+                    f"Text extraction failed: {e}"
+                )
 
-                    st.session_state[
-                        "document_text"
-                    ] = full_text
+                st.stop()
 
-                    st.success(
-                        "Structured extraction completed!"
-                    )
+        if not full_text.strip():
 
-                    st.json(
-                        structured_data
-                    )
-
-                except Exception as e:
-
-                    st.error(
-                        f"AI extraction failed: {e}"
-                    )
-
-        else:
-
-            st.warning(
-                "No text was found in the document."
+            st.error(
+                "No text could be extracted from the document."
             )
 
+            st.stop()
 
-    # ========================================================
-    # VALIDATION + EVIDENCE + CONFIDENCE
-    # ========================================================
+        # Save extracted text
+        st.session_state[
+            "document_text"
+        ] = full_text
 
-    if "structured_data" in st.session_state:
+        # ----------------------------------------------------
+        # SHOW EXTRACTED TEXT
+        # ----------------------------------------------------
+
+        with st.expander(
+            "🔎 View Extracted Text"
+        ):
+
+            st.text_area(
+                "Document text",
+                full_text,
+                height=300
+            )
+
+        # ----------------------------------------------------
+        # STEP 2 — AI EXTRACTION
+        # ----------------------------------------------------
+
+        with st.spinner(
+            "AI is analyzing the document..."
+        ):
+
+            try:
+
+                structured_json = (
+                    extract_structured_data(
+                        full_text
+                    )
+                )
+
+                structured_json = (
+                    clean_json_response(
+                        structured_json
+                    )
+                )
+
+                structured_data = json.loads(
+                    structured_json
+                )
+
+                # Save extracted data
+                st.session_state[
+                    "structured_data"
+                ] = structured_data
+
+                st.success(
+                    "Structured extraction completed!"
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"AI extraction failed: {e}"
+                )
+
+                st.stop()
+
+        # ----------------------------------------------------
+        # STEP 3 — VALIDATION
+        # ----------------------------------------------------
+
+        validation_results = (
+            process_validation(
+                structured_data,
+                full_text
+            )
+        )
+
+        overall_quality = (
+            calculate_overall_quality(
+                validation_results
+            )
+        )
+
+        st.session_state[
+            "validation_results"
+        ] = validation_results
+
+        st.session_state[
+            "quality_score"
+        ] = overall_quality
+
+        # ----------------------------------------------------
+        # STEP 4 — RESULTS DASHBOARD
+        # ----------------------------------------------------
 
         st.divider()
 
-        st.subheader(
+        st.header(
             "🛡️ Verification & Validation"
         )
 
-        validation_results, overall_score = (
-            validate_data(
-                st.session_state[
-                    "structured_data"
-                ],
-                st.session_state[
-                    "document_text"
-                ]
-            )
-        )
-
-
-        # ====================================================
-        # OVERALL SCORE
-        # ====================================================
-
+        # Overall score
         st.metric(
             "Overall Extraction Quality",
-            f"{overall_score}%"
+            f"{overall_quality}%"
         )
 
-
-        # ====================================================
-        # FIELD-LEVEL RESULTS
-        # ====================================================
-
-        st.subheader(
-            "📊 Field-Level Confidence"
+        st.markdown(
+            "### 📊 Field-Level Confidence"
         )
 
-        for result in validation_results:
+        # ----------------------------------------------------
+        # FIELD RESULTS
+        # ----------------------------------------------------
 
-            field = result["field"]
-            status = result["status"]
-            message = result["message"]
-            evidence = result.get(
+        for field, result in validation_results.items():
+
+            value = result[
+                "value"
+            ]
+
+            evidence = result[
                 "evidence"
-            )
-            evidence_verified = result.get(
-                "evidence_verified",
-                False
-            )
-            confidence = result.get(
-                "confidence",
-                0
-            )
+            ]
 
+            status = result[
+                "status"
+            ]
 
-            # ------------------------------------------------
-            # Confidence label
-            # ------------------------------------------------
+            evidence_verified = result[
+                "evidence_verified"
+            ]
 
-            if confidence >= 80:
+            confidence = result[
+                "confidence"
+            ]
 
-                confidence_label = "🟢 High"
-
-            elif confidence >= 50:
-
-                confidence_label = "🟡 Medium"
-
-            else:
-
-                confidence_label = "🔴 Low"
-
-
-            st.write(
-                f"**{field}** — "
-                f"{confidence_label} "
-                f"({confidence}%)"
+            label = confidence_label(
+                confidence
             )
 
+            field_name = (
+                field
+                .replace(
+                    "_",
+                    " "
+                )
+                .title()
+            )
 
-            # ------------------------------------------------
-            # Validation status
-            # ------------------------------------------------
+            # Field heading
+            st.markdown(
+                f"**{field_name}** — "
+                f"{label} ({confidence}%)"
+            )
 
-            if status == "Valid":
+            # Value
+            if value is not None:
 
-                st.success(
-                    f"✓ {field}: {message}"
+                st.write(
+                    f"**Value:** {value}"
                 )
 
-            elif status == "Missing":
+            else:
 
                 st.warning(
-                    f"⚠ {field}: {message}"
+                    f"{field_name}: No value found."
                 )
 
-            elif status == "Invalid":
+            # Validation
+            if value is not None:
 
-                st.error(
-                    f"✗ {field}: {message}"
-                )
+                if status == "Valid":
 
-            else:
+                    st.success(
+                        f"{field_name}: Valid"
+                    )
 
-                st.info(
-                    f"ℹ {field}: {message}"
-                )
+                elif status == "Invalid":
 
+                    st.error(
+                        f"{field_name}: Invalid value"
+                    )
 
-            # ------------------------------------------------
             # Evidence
-            # ------------------------------------------------
-
             if evidence:
 
                 if evidence_verified:
 
-                    st.caption(
-                        f'📌 Evidence verified: '
-                        f'"{evidence}"'
+                    st.info(
+                        f'📌 Evidence verified: "{evidence}"'
                     )
 
                 else:
 
-                    st.caption(
-                        f'⚠ Evidence needs review: '
-                        f'"{evidence}"'
+                    st.warning(
+                        f'⚠️ Evidence needs review: "{evidence}"'
                     )
 
+            st.divider()
 
-        st.divider()
+        # ----------------------------------------------------
+        # CLEAN STRUCTURED DATA TABLE
+        # ----------------------------------------------------
 
-        st.caption(
-            "The Extraction Quality Score is a "
-            "rule-based quality indicator. "
-            "Field confidence combines validation "
-            "and evidence verification. It is not "
-            "a guarantee of correctness."
+        st.markdown(
+            "### 📋 Structured Results"
+        )
+
+        table_data = []
+
+        for field, result in validation_results.items():
+
+            table_data.append(
+                {
+                    "Field": field.replace(
+                        "_",
+                        " "
+                    ).title(),
+
+                    "Value": (
+                        result["value"]
+                        if result["value"] is not None
+                        else "Not found"
+                    ),
+
+                    "Validation": result[
+                        "status"
+                    ],
+
+                    "Confidence": (
+                        f'{result["confidence"]}%'
+                    ),
+
+                    "Evidence Verified": (
+                        "Yes"
+                        if result[
+                            "evidence_verified"
+                        ]
+                        else "No"
+                    )
+                }
+            )
+
+        st.dataframe(
+            table_data,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ----------------------------------------------------
+        # RAW JSON
+        # ----------------------------------------------------
+
+        with st.expander(
+            "🧩 View Raw JSON"
+        ):
+
+            st.json(
+                structured_data
+            )
+
+        # ----------------------------------------------------
+        # DOWNLOAD JSON
+        # ----------------------------------------------------
+
+        json_download = json.dumps(
+            structured_data,
+            indent=4,
+            ensure_ascii=False
+        )
+
+        st.download_button(
+            label="📥 Download Structured JSON",
+            data=json_download,
+            file_name="doctruth_extraction.json",
+            mime="application/json"
         )
