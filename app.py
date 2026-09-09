@@ -1,5 +1,402 @@
 import streamlit as st
 import fitz
+import pytesseract
+from PIL import Image
+import io
+import os
+import json
+import re
+from datetime import datetime
+from dotenv import load_dotenv
+from google import genai
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv()
+
+client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY")
+)
+
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+
+# ============================================================
+# AI EXTRACTION WITH EVIDENCE
+# ============================================================
+
+def extract_structured_data(text):
+
+    prompt = """
+You are a document intelligence assistant.
+
+Extract important information from the document.
+
+For every extracted field, return:
+- value
+- evidence
+
+The evidence MUST be an exact short quote copied from the
+provided document text that supports the value.
+
+If a field is not present:
+- value = null
+- evidence = null
+
+Return JSON only.
+
+Use these fields:
+
+- document_type
+- invoice_number
+- date
+- customer_name
+- vendor_name
+- total_amount
+- currency
+- phone
+- email
+
+Rules:
+
+1. Never invent information.
+2. Evidence must come directly from the document.
+3. Keep evidence short.
+4. Do not create evidence for a missing field.
+5. Only classify something as vendor_name if the document
+   clearly identifies it as a vendor/company/service provider.
+6. For total_amount, return the numeric value.
+7. Preserve original information when possible.
+
+Example format:
+
+{
+    "document_type": {
+        "value": "invoice",
+        "evidence": "Invoice"
+    },
+    "invoice_number": {
+        "value": "INV-1024",
+        "evidence": "Invoice No: INV-1024"
+    },
+    "date": {
+        "value": "15/09/2026",
+        "evidence": "Date: 15/09/2026"
+    },
+    "customer_name": {
+        "value": null,
+        "evidence": null
+    }
+}
+
+DOCUMENT:
+
+""" + text
+
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json"
+        }
+    )
+
+    return response.text
+
+
+# ============================================================
+# EVIDENCE VERIFICATION
+# ============================================================
+
+def verify_evidence(value, evidence, original_text):
+
+    if not value or not evidence:
+        return False
+
+    # Normalize whitespace for comparison
+    normalized_document = re.sub(
+        r"\s+",
+        " ",
+        original_text
+    ).strip().lower()
+
+    normalized_evidence = re.sub(
+        r"\s+",
+        " ",
+        str(evidence)
+    ).strip().lower()
+
+    # Exact evidence check
+    if normalized_evidence in normalized_document:
+        return True
+
+    # Sometimes OCR changes punctuation.
+    # Try a simplified comparison.
+    simplified_document = re.sub(
+        r"[^a-z0-9@.\s]",
+        "",
+        normalized_document
+    )
+
+    simplified_evidence = re.sub(
+        r"[^a-z0-9@.\s]",
+        "",
+        normalized_evidence
+    )
+
+    return simplified_evidence in simplified_document
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_data(data, original_text):
+
+    results = []
+    score = 100
+
+    for field_name, field_data in data.items():
+
+        # ----------------------------------------------------
+        # Handle expected {value, evidence} structure
+        # ----------------------------------------------------
+
+        if isinstance(field_data, dict):
+
+            value = field_data.get("value")
+            evidence = field_data.get("evidence")
+
+        else:
+
+            # Fallback if AI returns old-style data
+            value = field_data
+            evidence = None
+
+
+        display_name = field_name.replace(
+            "_",
+            " "
+        ).title()
+
+
+        # ----------------------------------------------------
+        # Missing field
+        # ----------------------------------------------------
+
+        if value is None or str(value).strip() == "":
+
+            results.append(
+                {
+                    "field": display_name,
+                    "status": "Missing",
+                    "message": "No value found.",
+                    "evidence_verified": False
+                }
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # Evidence verification
+        # ----------------------------------------------------
+
+        evidence_verified = verify_evidence(
+            value,
+            evidence,
+            original_text
+        )
+
+
+        # ----------------------------------------------------
+        # Email
+        # ----------------------------------------------------
+
+        if field_name == "email":
+
+            email_pattern = (
+                r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+            )
+
+            if re.match(
+                email_pattern,
+                str(value)
+            ):
+
+                status = "Valid"
+
+                message = (
+                    "Email format is valid."
+                )
+
+            else:
+
+                status = "Invalid"
+
+                message = (
+                    "Email format appears incorrect."
+                )
+
+                score -= 15
+
+
+        # ----------------------------------------------------
+        # Phone
+        # ----------------------------------------------------
+
+        elif field_name == "phone":
+
+            digits = re.sub(
+                r"\D",
+                "",
+                str(value)
+            )
+
+            if 10 <= len(digits) <= 15:
+
+                status = "Valid"
+
+                message = (
+                    "Phone number has a plausible length."
+                )
+
+            else:
+
+                status = "Invalid"
+
+                message = (
+                    "Phone number length looks unusual."
+                )
+
+                score -= 15
+
+
+        # ----------------------------------------------------
+        # Date
+        # ----------------------------------------------------
+
+        elif field_name == "date":
+
+            valid_date = False
+
+            for fmt in [
+                "%d/%m/%Y",
+                "%d-%m-%Y",
+                "%Y-%m-%d",
+                "%d/%m/%y",
+                "%d-%m-%y"
+            ]:
+
+                try:
+
+                    datetime.strptime(
+                        str(value),
+                        fmt
+                    )
+
+                    valid_date = True
+                    break
+
+                except ValueError:
+                    pass
+
+            if valid_date:
+
+                status = "Valid"
+
+                message = "Date format is valid."
+
+            else:
+
+                status = "Needs review"
+
+                message = (
+                    "Date was extracted but could not "
+                    "be verified."
+                )
+
+                score -= 10
+
+
+        # ----------------------------------------------------
+        # Amount
+        # ----------------------------------------------------
+
+        elif field_name == "total_amount":
+
+            try:
+
+                float(
+                    str(value).replace(",", "")
+                )
+
+                status = "Valid"
+
+                message = "Amount is numeric."
+
+            except ValueError:
+
+                status = "Invalid"
+
+                message = "Amount is not numeric."
+
+                score -= 15
+
+
+        # ----------------------------------------------------
+        # Other fields
+        # ----------------------------------------------------
+
+        else:
+
+            status = "Extracted"
+
+            message = "Value extracted from document."
+
+
+        # ----------------------------------------------------
+        # Evidence failure
+        # ----------------------------------------------------
+
+        if not evidence_verified:
+
+            score -= 10
+
+            message += (
+                " Evidence could not be verified "
+                "against the original text."
+            )
+
+
+        results.append(
+            {
+                "field": display_name,
+                "status": status,
+                "message": message,
+                "evidence_verified": evidence_verified,
+                "value": value,
+                "evidence": evidence
+            }
+        )
+
+
+    score = max(
+        0,
+        min(100, score)
+    )
+
+    return results, score
+
+
+# ============================================================
+# STREAMLIT PAGE
+# ============================================================
 
 st.set_page_config(
     page_title="DocTruth AI",
@@ -8,57 +405,337 @@ st.set_page_config(
 )
 
 st.title("📄 DocTruth AI")
-st.write("From unstructured documents to structured, verified data.")
+
+st.write(
+    "From unstructured documents to structured, verified data."
+)
 
 st.divider()
 
-st.subheader("Upload your document")
+
+# ============================================================
+# UPLOAD
+# ============================================================
+
+st.subheader("📤 Upload your document")
 
 uploaded_file = st.file_uploader(
-    "Upload a PDF",
-    type=["pdf"]
+    "Upload a PDF or image",
+    type=[
+        "pdf",
+        "png",
+        "jpg",
+        "jpeg"
+    ]
 )
+
+
+# ============================================================
+# DOCUMENT PROCESSING
+# ============================================================
 
 if uploaded_file is not None:
 
-    st.success("Document uploaded successfully!")
+    file_bytes = uploaded_file.read()
 
-    st.write("**File name:**", uploaded_file.name)
-    st.write("**File type:**", uploaded_file.type)
-    st.write("**File size:**", uploaded_file.size, "bytes")
-
-    # Read the uploaded PDF
-    pdf_bytes = uploaded_file.read()
-
-    # Open the PDF
-    document = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
+    st.success(
+        "Document uploaded successfully!"
     )
 
-    st.write("**Number of pages:**", len(document))
+    st.write(
+        "**File name:**",
+        uploaded_file.name
+    )
+
+    st.write(
+        "**File type:**",
+        uploaded_file.type
+    )
+
+    st.write(
+        "**File size:**",
+        uploaded_file.size,
+        "bytes"
+    )
 
     st.divider()
 
-    st.subheader("Extracted text")
 
-    full_text = ""
+    # ========================================================
+    # IMAGE OCR
+    # ========================================================
 
-    for page_number, page in enumerate(document):
+    if uploaded_file.type.startswith("image/"):
 
-        text = page.get_text()
+        st.subheader("🔍 OCR Processing")
 
-        full_text += text + "\n"
+        image = Image.open(
+            io.BytesIO(file_bytes)
+        )
 
-        with st.expander(f"Page {page_number + 1}"):
-            st.text(text)
+        st.image(
+            image,
+            caption="Uploaded document",
+            width=500
+        )
+
+        with st.spinner(
+            "Reading document with OCR..."
+        ):
+
+            full_text = pytesseract.image_to_string(
+                image
+            )
+
+        st.success("OCR completed!")
+
+        st.subheader("📝 Extracted Text")
+
+        st.text_area(
+            "OCR Result",
+            full_text,
+            height=400
+        )
+
+
+    # ========================================================
+    # PDF PROCESSING
+    # ========================================================
+
+    elif uploaded_file.type == "application/pdf":
+
+        document = fitz.open(
+            stream=file_bytes,
+            filetype="pdf"
+        )
+
+        st.write(
+            "**Number of pages:**",
+            len(document)
+        )
+
+        full_text = ""
+
+        for page_number, page in enumerate(document):
+
+            text = page.get_text()
+
+            if text.strip():
+
+                full_text += text + "\n"
+
+                with st.expander(
+                    f"Page {page_number + 1} — Text extracted"
+                ):
+
+                    st.text(text)
+
+            else:
+
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(2, 2)
+                )
+
+                image = Image.frombytes(
+                    "RGB",
+                    [
+                        pix.width,
+                        pix.height
+                    ],
+                    pix.samples
+                )
+
+                with st.spinner(
+                    f"Running OCR on page {page_number + 1}..."
+                ):
+
+                    ocr_text = pytesseract.image_to_string(
+                        image
+                    )
+
+                full_text += ocr_text + "\n"
+
+                with st.expander(
+                    f"Page {page_number + 1} — OCR"
+                ):
+
+                    st.text(ocr_text)
+
+
+        st.divider()
+
+        st.subheader(
+            "📝 Complete Document Text"
+        )
+
+        st.text_area(
+            "Extracted text",
+            full_text,
+            height=400
+        )
+
+
+    # ========================================================
+    # AI EXTRACTION
+    # ========================================================
 
     st.divider()
 
-    st.subheader("Complete document text")
-
-    st.text_area(
-        "Extracted text",
-        full_text,
-        height=300
+    st.subheader(
+        "🤖 AI Structured Extraction"
     )
+
+    if st.button(
+        "Extract structured data",
+        type="primary"
+    ):
+
+        if full_text.strip():
+
+            with st.spinner(
+                "AI is analyzing the document..."
+            ):
+
+                try:
+
+                    structured_json = (
+                        extract_structured_data(
+                            full_text
+                        )
+                    )
+
+                    structured_data = json.loads(
+                        structured_json
+                    )
+
+                    st.session_state[
+                        "structured_data"
+                    ] = structured_data
+
+                    st.session_state[
+                        "document_text"
+                    ] = full_text
+
+                    st.success(
+                        "Structured extraction completed!"
+                    )
+
+                    st.json(
+                        structured_data
+                    )
+
+                except Exception as e:
+
+                    st.error(
+                        f"AI extraction failed: {e}"
+                    )
+
+        else:
+
+            st.warning(
+                "No text was found in the document."
+            )
+
+
+    # ========================================================
+    # VALIDATION + EVIDENCE
+    # ========================================================
+
+    if "structured_data" in st.session_state:
+
+        st.divider()
+
+        st.subheader(
+            "🛡️ Verification & Validation"
+        )
+
+        validation_results, confidence_score = (
+            validate_data(
+                st.session_state[
+                    "structured_data"
+                ],
+                st.session_state[
+                    "document_text"
+                ]
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # QUALITY SCORE
+        # ----------------------------------------------------
+
+        st.metric(
+            "Extraction Quality Score",
+            f"{confidence_score}%"
+        )
+
+
+        # ----------------------------------------------------
+        # FIELD RESULTS
+        # ----------------------------------------------------
+
+        for result in validation_results:
+
+            field = result["field"]
+            status = result["status"]
+            message = result["message"]
+            evidence = result.get("evidence")
+            evidence_verified = result.get(
+                "evidence_verified",
+                False
+            )
+
+            if status == "Valid":
+
+                st.success(
+                    f"✓ {field}: {message}"
+                )
+
+            elif status == "Missing":
+
+                st.warning(
+                    f"⚠ {field}: {message}"
+                )
+
+            elif status == "Invalid":
+
+                st.error(
+                    f"✗ {field}: {message}"
+                )
+
+            else:
+
+                st.info(
+                    f"ℹ {field}: {message}"
+                )
+
+
+            # ------------------------------------------------
+            # Evidence
+            # ------------------------------------------------
+
+            if evidence:
+
+                if evidence_verified:
+
+                    st.caption(
+                        f"📌 Evidence verified: "
+                        f'"{evidence}"'
+                    )
+
+                else:
+
+                    st.caption(
+                        f"⚠ Evidence needs review: "
+                        f'"{evidence}"'
+                    )
+
+
+        st.divider()
+
+        st.caption(
+            "The Extraction Quality Score is a rule-based "
+            "quality indicator. Evidence is checked against "
+            "the original extracted document text."
+        )
