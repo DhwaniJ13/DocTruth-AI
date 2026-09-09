@@ -73,7 +73,7 @@ Rules:
 6. For total_amount, return the numeric value.
 7. Preserve original information when possible.
 
-Example format:
+Example:
 
 {
     "document_type": {
@@ -118,7 +118,6 @@ def verify_evidence(value, evidence, original_text):
     if not value or not evidence:
         return False
 
-    # Normalize whitespace for comparison
     normalized_document = re.sub(
         r"\s+",
         " ",
@@ -131,12 +130,11 @@ def verify_evidence(value, evidence, original_text):
         str(evidence)
     ).strip().lower()
 
-    # Exact evidence check
+    # Exact evidence match
     if normalized_evidence in normalized_document:
         return True
 
-    # Sometimes OCR changes punctuation.
-    # Try a simplified comparison.
+    # Simplified comparison for OCR punctuation differences
     simplified_document = re.sub(
         r"[^a-z0-9@.\s]",
         "",
@@ -153,18 +151,20 @@ def verify_evidence(value, evidence, original_text):
 
 
 # ============================================================
-# VALIDATION
+# VALIDATION + CONFIDENCE
 # ============================================================
 
 def validate_data(data, original_text):
 
     results = []
-    score = 100
+
+    overall_score = 0
+    scored_fields = 0
 
     for field_name, field_data in data.items():
 
         # ----------------------------------------------------
-        # Handle expected {value, evidence} structure
+        # Extract value and evidence
         # ----------------------------------------------------
 
         if isinstance(field_data, dict):
@@ -174,10 +174,8 @@ def validate_data(data, original_text):
 
         else:
 
-            # Fallback if AI returns old-style data
             value = field_data
             evidence = None
-
 
         display_name = field_name.replace(
             "_",
@@ -196,7 +194,10 @@ def validate_data(data, original_text):
                     "field": display_name,
                     "status": "Missing",
                     "message": "No value found.",
-                    "evidence_verified": False
+                    "evidence_verified": False,
+                    "value": None,
+                    "evidence": None,
+                    "confidence": 0
                 }
             )
 
@@ -215,7 +216,19 @@ def validate_data(data, original_text):
 
 
         # ----------------------------------------------------
-        # Email
+        # Base confidence
+        # ----------------------------------------------------
+
+        field_confidence = 50
+
+
+        # Evidence verified
+        if evidence_verified:
+            field_confidence += 30
+
+
+        # ----------------------------------------------------
+        # Email validation
         # ----------------------------------------------------
 
         if field_name == "email":
@@ -235,6 +248,8 @@ def validate_data(data, original_text):
                     "Email format is valid."
                 )
 
+                field_confidence += 20
+
             else:
 
                 status = "Invalid"
@@ -243,11 +258,11 @@ def validate_data(data, original_text):
                     "Email format appears incorrect."
                 )
 
-                score -= 15
+                field_confidence -= 30
 
 
         # ----------------------------------------------------
-        # Phone
+        # Phone validation
         # ----------------------------------------------------
 
         elif field_name == "phone":
@@ -266,6 +281,8 @@ def validate_data(data, original_text):
                     "Phone number has a plausible length."
                 )
 
+                field_confidence += 20
+
             else:
 
                 status = "Invalid"
@@ -274,24 +291,26 @@ def validate_data(data, original_text):
                     "Phone number length looks unusual."
                 )
 
-                score -= 15
+                field_confidence -= 30
 
 
         # ----------------------------------------------------
-        # Date
+        # Date validation
         # ----------------------------------------------------
 
         elif field_name == "date":
 
             valid_date = False
 
-            for fmt in [
+            date_formats = [
                 "%d/%m/%Y",
                 "%d-%m-%Y",
                 "%Y-%m-%d",
                 "%d/%m/%y",
                 "%d-%m-%y"
-            ]:
+            ]
+
+            for fmt in date_formats:
 
                 try:
 
@@ -310,22 +329,26 @@ def validate_data(data, original_text):
 
                 status = "Valid"
 
-                message = "Date format is valid."
+                message = (
+                    "Date format is valid."
+                )
+
+                field_confidence += 20
 
             else:
 
                 status = "Needs review"
 
                 message = (
-                    "Date was extracted but could not "
-                    "be verified."
+                    "Date was extracted but could "
+                    "not be verified."
                 )
 
-                score -= 10
+                field_confidence -= 10
 
 
         # ----------------------------------------------------
-        # Amount
+        # Amount validation
         # ----------------------------------------------------
 
         elif field_name == "total_amount":
@@ -338,15 +361,34 @@ def validate_data(data, original_text):
 
                 status = "Valid"
 
-                message = "Amount is numeric."
+                message = (
+                    "Amount is numeric."
+                )
+
+                field_confidence += 20
 
             except ValueError:
 
                 status = "Invalid"
 
-                message = "Amount is not numeric."
+                message = (
+                    "Amount is not numeric."
+                )
 
-                score -= 15
+                field_confidence -= 30
+
+
+        # ----------------------------------------------------
+        # Document type
+        # ----------------------------------------------------
+
+        elif field_name == "document_type":
+
+            status = "Detected"
+
+            message = (
+                "Document type identified."
+            )
 
 
         # ----------------------------------------------------
@@ -357,7 +399,9 @@ def validate_data(data, original_text):
 
             status = "Extracted"
 
-            message = "Value extracted from document."
+            message = (
+                "Value extracted from document."
+            )
 
 
         # ----------------------------------------------------
@@ -366,13 +410,32 @@ def validate_data(data, original_text):
 
         if not evidence_verified:
 
-            score -= 10
+            field_confidence -= 20
 
             message += (
                 " Evidence could not be verified "
                 "against the original text."
             )
 
+
+        # ----------------------------------------------------
+        # Keep confidence between 0 and 100
+        # ----------------------------------------------------
+
+        field_confidence = max(
+            0,
+            min(100, field_confidence)
+        )
+
+
+        # Add to overall score
+        overall_score += field_confidence
+        scored_fields += 1
+
+
+        # ----------------------------------------------------
+        # Store result
+        # ----------------------------------------------------
 
         results.append(
             {
@@ -381,17 +444,28 @@ def validate_data(data, original_text):
                 "message": message,
                 "evidence_verified": evidence_verified,
                 "value": value,
-                "evidence": evidence
+                "evidence": evidence,
+                "confidence": field_confidence
             }
         )
 
 
-    score = max(
-        0,
-        min(100, score)
-    )
+    # --------------------------------------------------------
+    # Overall confidence
+    # --------------------------------------------------------
 
-    return results, score
+    if scored_fields > 0:
+
+        overall_score = round(
+            overall_score / scored_fields
+        )
+
+    else:
+
+        overall_score = 0
+
+
+    return results, overall_score
 
 
 # ============================================================
@@ -638,7 +712,7 @@ if uploaded_file is not None:
 
 
     # ========================================================
-    # VALIDATION + EVIDENCE
+    # VALIDATION + EVIDENCE + CONFIDENCE
     # ========================================================
 
     if "structured_data" in st.session_state:
@@ -649,7 +723,7 @@ if uploaded_file is not None:
             "🛡️ Verification & Validation"
         )
 
-        validation_results, confidence_score = (
+        validation_results, overall_score = (
             validate_data(
                 st.session_state[
                     "structured_data"
@@ -661,30 +735,69 @@ if uploaded_file is not None:
         )
 
 
-        # ----------------------------------------------------
-        # QUALITY SCORE
-        # ----------------------------------------------------
+        # ====================================================
+        # OVERALL SCORE
+        # ====================================================
 
         st.metric(
-            "Extraction Quality Score",
-            f"{confidence_score}%"
+            "Overall Extraction Quality",
+            f"{overall_score}%"
         )
 
 
-        # ----------------------------------------------------
-        # FIELD RESULTS
-        # ----------------------------------------------------
+        # ====================================================
+        # FIELD-LEVEL RESULTS
+        # ====================================================
+
+        st.subheader(
+            "📊 Field-Level Confidence"
+        )
 
         for result in validation_results:
 
             field = result["field"]
             status = result["status"]
             message = result["message"]
-            evidence = result.get("evidence")
+            evidence = result.get(
+                "evidence"
+            )
             evidence_verified = result.get(
                 "evidence_verified",
                 False
             )
+            confidence = result.get(
+                "confidence",
+                0
+            )
+
+
+            # ------------------------------------------------
+            # Confidence label
+            # ------------------------------------------------
+
+            if confidence >= 80:
+
+                confidence_label = "🟢 High"
+
+            elif confidence >= 50:
+
+                confidence_label = "🟡 Medium"
+
+            else:
+
+                confidence_label = "🔴 Low"
+
+
+            st.write(
+                f"**{field}** — "
+                f"{confidence_label} "
+                f"({confidence}%)"
+            )
+
+
+            # ------------------------------------------------
+            # Validation status
+            # ------------------------------------------------
 
             if status == "Valid":
 
@@ -720,14 +833,14 @@ if uploaded_file is not None:
                 if evidence_verified:
 
                     st.caption(
-                        f"📌 Evidence verified: "
+                        f'📌 Evidence verified: '
                         f'"{evidence}"'
                     )
 
                 else:
 
                     st.caption(
-                        f"⚠ Evidence needs review: "
+                        f'⚠ Evidence needs review: '
                         f'"{evidence}"'
                     )
 
@@ -735,7 +848,9 @@ if uploaded_file is not None:
         st.divider()
 
         st.caption(
-            "The Extraction Quality Score is a rule-based "
-            "quality indicator. Evidence is checked against "
-            "the original extracted document text."
+            "The Extraction Quality Score is a "
+            "rule-based quality indicator. "
+            "Field confidence combines validation "
+            "and evidence verification. It is not "
+            "a guarantee of correctness."
         )
