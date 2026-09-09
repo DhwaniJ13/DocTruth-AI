@@ -454,26 +454,31 @@ def calculate_confidence(
     evidence_verified
 ):
     """
-    Calculate field-level confidence.
+    Calculate field-level confidence using
+    independent validation signals.
     """
 
+    # No extracted value
     if value is None:
         return 0
 
+    # Start with a neutral score
     score = 50
 
+    # Evidence is the strongest trust signal
     if evidence_verified:
-        score += 30
+        score += 25
+    else:
+        score -= 20
 
+    # Rule-based validation
     if status == "Valid":
-        score += 20
+        score += 15
 
     elif status == "Invalid":
         score -= 30
 
-    if not evidence_verified:
-        score -= 20
-
+    # Keep score between 0 and 100
     score = max(
         0,
         min(
